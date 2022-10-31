@@ -18,7 +18,6 @@ package tpp
 
 import (
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"log"
@@ -34,19 +33,40 @@ import (
 
 	"github.com/Venafi/vcert/v4/pkg/certificate"
 	"github.com/Venafi/vcert/v4/pkg/endpoint"
+	"github.com/Venafi/vcert/v4/pkg/venafi/tpp/tpp_api"
+	"github.com/Venafi/vcert/v4/pkg/venafi/tpp/tpp_api/tpp_convert"
+	"github.com/Venafi/vcert/v4/pkg/venafi/tpp/tpp_api/tpp_structs"
+	"github.com/Venafi/vcert/v4/pkg/venafi/tpp/tpp_api/tpp_validate"
 	"github.com/Venafi/vcert/v4/pkg/verror"
 )
 
 // Connector contains the base data needed to communicate with a TPP Server
 type Connector struct {
-	baseURL     string
+	baseURL string
+	client  *http.Client
+
 	apiKey      string
 	accessToken string
-	verbose     bool
-	Identity    identity
-	trust       *x509.CertPool
-	zone        string
-	client      *http.Client
+
+	verbose  bool
+	Identity tpp_structs.Identity
+	trust    *x509.CertPool
+	zone     string
+}
+
+func (c *Connector) rawClient() *tpp_api.RawClient {
+	return &tpp_api.RawClient{
+		BaseUrl:    c.baseURL,
+		HttpClient: c.getHTTPClient(),
+		Authenticator: func(r *http.Request) error {
+			if c.accessToken != "" {
+				r.Header.Add("Authorization", fmt.Sprintf("Bearer %s", c.accessToken))
+			} else if c.apiKey != "" {
+				r.Header.Add("x-venafi-api-key", c.apiKey)
+			}
+			return nil
+		},
+	}
 }
 
 func (c *Connector) IsCSRServiceGenerated(req *certificate.Request) (bool, error) {
@@ -103,18 +123,11 @@ func (c *Connector) GetType() endpoint.ConnectorType {
 }
 
 // Ping attempts to connect to the TPP Server WebSDK API and returns an error if it cannot
-func (c *Connector) Ping() (err error) {
-
+func (c *Connector) Ping() error {
 	//Extended timeout to allow the server to wake up
 	c.getHTTPClient().Timeout = time.Second * 90
-	statusCode, status, _, err := c.request("GET", "vedsdk/", nil)
-	if err != nil {
-		return
-	}
-	if statusCode != http.StatusOK {
-		err = fmt.Errorf(status)
-	}
-	return
+
+	return c.rawClient().GetVedSdk()
 }
 
 // Authenticate authenticates the user to the TPP
@@ -134,13 +147,12 @@ func (c *Connector) Authenticate(auth *endpoint.Authentication) (err error) {
 	}
 
 	if auth.User != "" && auth.Password != "" {
-		data := authorizeResquest{Username: auth.User, Password: auth.Password}
-		result, err := processAuthData(c, urlResourceAuthorize, data)
+		data := tpp_structs.AuthorizeRequest{Username: auth.User, Password: auth.Password}
+		resp, err := c.rawClient().PostAuthorize(&data)
 		if err != nil {
 			return err
 		}
 
-		resp := result.(authorizeResponse)
 		c.apiKey = resp.APIKey
 
 		if c.client != nil {
@@ -152,13 +164,12 @@ func (c *Connector) Authenticate(auth *endpoint.Authentication) (err error) {
 		return nil
 
 	} else if auth.RefreshToken != "" {
-		data := oauthRefreshAccessTokenRequest{Client_id: auth.ClientId, Refresh_token: auth.RefreshToken}
-		result, err := processAuthData(c, urlResourceRefreshAccessToken, data)
+		data := tpp_structs.OAuthRefreshAccessTokenRequest{Client_id: auth.ClientId, Refresh_token: auth.RefreshToken}
+		resp, err := c.rawClient().PostAuthorizeRefreshAccessToken(&data)
 		if err != nil {
 			return err
 		}
 
-		resp := result.(OauthRefreshAccessTokenResponse)
 		c.accessToken = resp.Access_token
 		auth.RefreshToken = resp.Refresh_token
 		if c.client != nil {
@@ -184,7 +195,7 @@ func (c *Connector) Authenticate(auth *endpoint.Authentication) (err error) {
 }
 
 // GetRefreshToken Get OAuth refresh and access token
-func (c *Connector) GetRefreshToken(auth *endpoint.Authentication) (resp OauthGetRefreshTokenResponse, err error) {
+func (c *Connector) GetRefreshToken(auth *endpoint.Authentication) (resp *tpp_structs.OAuthGetRefreshTokenResponse, err error) {
 
 	if auth == nil {
 		return resp, fmt.Errorf("failed to authenticate: missing credentials")
@@ -198,22 +209,19 @@ func (c *Connector) GetRefreshToken(auth *endpoint.Authentication) (resp OauthGe
 	}
 
 	if auth.User != "" && auth.Password != "" {
-		data := oauthGetRefreshTokenRequest{Username: auth.User, Password: auth.Password, Scope: auth.Scope, Client_id: auth.ClientId}
-		result, err := processAuthData(c, urlResourceAuthorizeOAuth, data)
+		data := tpp_structs.OAuthGetRefreshTokenRequest{Username: auth.User, Password: auth.Password, Scope: auth.Scope, Client_id: auth.ClientId}
+		resp, err := c.rawClient().PostAuthorizeOAuth(&data)
 		if err != nil {
 			return resp, err
 		}
-		resp = result.(OauthGetRefreshTokenResponse)
 		return resp, nil
 
 	} else if auth.ClientPKCS12 {
-		data := oauthCertificateTokenRequest{Client_id: auth.ClientId, Scope: auth.Scope}
-		result, err := processAuthData(c, urlResourceAuthorizeCertificate, data)
+		data := tpp_structs.OAuthCertificateTokenRequest{Client_id: auth.ClientId, Scope: auth.Scope}
+		resp, err := c.rawClient().PostAuthorizeCertificate(&data)
 		if err != nil {
 			return resp, err
 		}
-
-		resp = result.(OauthGetRefreshTokenResponse)
 		return resp, nil
 	}
 
@@ -221,7 +229,7 @@ func (c *Connector) GetRefreshToken(auth *endpoint.Authentication) (resp OauthGe
 }
 
 // RefreshAccessToken Refresh OAuth access token
-func (c *Connector) RefreshAccessToken(auth *endpoint.Authentication) (resp OauthRefreshAccessTokenResponse, err error) {
+func (c *Connector) RefreshAccessToken(auth *endpoint.Authentication) (resp *tpp_structs.OAuthRefreshAccessTokenResponse, err error) {
 
 	if auth == nil {
 		return resp, fmt.Errorf("failed to authenticate: missing credentials")
@@ -232,12 +240,11 @@ func (c *Connector) RefreshAccessToken(auth *endpoint.Authentication) (resp Oaut
 	}
 
 	if auth.RefreshToken != "" {
-		data := oauthRefreshAccessTokenRequest{Client_id: auth.ClientId, Refresh_token: auth.RefreshToken}
-		result, err := processAuthData(c, urlResourceRefreshAccessToken, data)
+		data := tpp_structs.OAuthRefreshAccessTokenRequest{Client_id: auth.ClientId, Refresh_token: auth.RefreshToken}
+		resp, err := c.rawClient().PostAuthorizeRefreshAccessToken(&data)
 		if err != nil {
 			return resp, err
 		}
-		resp = result.(OauthRefreshAccessTokenResponse)
 		return resp, nil
 	} else {
 		return resp, fmt.Errorf("failed to authenticate: missing refresh token")
@@ -245,28 +252,19 @@ func (c *Connector) RefreshAccessToken(auth *endpoint.Authentication) (resp Oaut
 }
 
 // VerifyAccessToken - call to check whether token is valid and, if so, return its properties
-func (c *Connector) VerifyAccessToken(auth *endpoint.Authentication) (resp OauthVerifyTokenResponse, err error) {
-
+func (c *Connector) VerifyAccessToken(auth *endpoint.Authentication) (resp tpp_structs.OAuthVerifyTokenResponse, err error) {
 	if auth == nil {
 		return resp, fmt.Errorf("failed to authenticate: missing credentials")
 	}
 
 	if auth.AccessToken != "" {
 		c.accessToken = auth.AccessToken
-		statusCode, statusText, body, err := c.request("GET", urlResource(urlResourceAuthorizeVerify), nil)
+		result, err := c.rawClient().GetAuthorizeVerify()
 		if err != nil {
 			return resp, err
 		}
 
-		if statusCode == http.StatusOK {
-			var result = &OauthVerifyTokenResponse{}
-			err = json.Unmarshal(body, result)
-			if err != nil {
-				return resp, fmt.Errorf("failed to parse verify token response: %s, body: %s", err, body)
-			}
-			return *result, nil
-		}
-		return resp, fmt.Errorf("failed to verify token. Message: %s", statusText)
+		return *result, nil
 	}
 
 	return resp, fmt.Errorf("failed to authenticate: missing access token")
@@ -281,111 +279,45 @@ func (c *Connector) RevokeAccessToken(auth *endpoint.Authentication) (err error)
 
 	if auth.AccessToken != "" {
 		c.accessToken = auth.AccessToken
-		statusCode, statusText, _, err := c.request("GET", urlResource(urlResourceRevokeAccessToken), nil)
-		if err != nil {
-			return err
-		}
 
-		if statusCode == http.StatusOK {
-			return nil
-		}
-		return fmt.Errorf("failed to revoke token. Message: %s", statusText)
+		return c.rawClient().GetRevokeAccessToken()
 	}
 
 	return fmt.Errorf("failed to authenticate: missing access token")
 }
 
-func processAuthData(c *Connector, url urlResource, data interface{}) (resp interface{}, err error) {
-
-	//isReachable, err := c.isAuthServerReachable()
-	//if err != nil {
-	//	return nil, err
-	//}
-	//if !isReachable {
-	//	return nil, fmt.Errorf("authentication server is not reachable: %s", c.baseURL)
-	//}
-
-	statusCode, status, body, err := c.request("POST", url, data)
-	if err != nil {
-		return resp, err
-	}
-
-	var getRefresh OauthGetRefreshTokenResponse
-	var refreshAccess OauthRefreshAccessTokenResponse
-	var authorize authorizeResponse
-
-	if statusCode == http.StatusOK {
-		switch data.(type) {
-		case oauthGetRefreshTokenRequest:
-			err = json.Unmarshal(body, &getRefresh)
-			if err != nil {
-				return resp, err
-			}
-			resp = getRefresh
-		case oauthRefreshAccessTokenRequest:
-			err = json.Unmarshal(body, &refreshAccess)
-			if err != nil {
-				return resp, err
-			}
-			resp = refreshAccess
-		case authorizeResquest:
-			err = json.Unmarshal(body, &authorize)
-			if err != nil {
-				return resp, err
-			}
-			resp = authorize
-		case oauthCertificateTokenRequest:
-			err = json.Unmarshal(body, &getRefresh)
-			if err != nil {
-				return resp, err
-			}
-			resp = getRefresh
-		default:
-			return resp, fmt.Errorf("can not determine data type")
-		}
-	} else {
-		return resp, fmt.Errorf("unexpected status code on TPP Authorize. Status: %s", status)
-	}
-
-	return resp, nil
-}
-
 func (c *Connector) isAuthServerReachable() (bool, error) {
-	url := urlResource(urlResourceAuthorizeIsAuthServer)
-
 	// Extended timeout to allow the server to wake up
 	c.getHTTPClient().Timeout = time.Second * 90
-	statusCode, statusText, _, err := c.request("GET", url, nil)
-	if err != nil {
-		return false, fmt.Errorf("error while cheking the authentication server. URL: %s; Error: %v", url, err)
-	}
 
-	if statusCode == http.StatusAccepted && strings.Contains(statusText, "Venafi Authentication Server") {
-		return true, nil
-	}
-	return false, fmt.Errorf("invalid authentication server. URL: %s; Status Code: %d; Status Text: %s", url, statusCode, statusText)
+	err := c.rawClient().GetIsAuthServer()
+
+	// panic("add test below")
+	// if statusCode == http.StatusAccepted && strings.Contains(statusText, "Venafi Authentication Server") {
+
+	return err == nil, err
 }
 
-func wrapAltNames(req *certificate.Request) (items []sanItem) {
+func wrapAltNames(req *certificate.Request) (items []tpp_structs.SanItem) {
 	for _, name := range req.EmailAddresses {
-		items = append(items, sanItem{1, name})
+		items = append(items, tpp_structs.SanItem{1, name})
 	}
 	for _, name := range req.DNSNames {
-		items = append(items, sanItem{2, name})
+		items = append(items, tpp_structs.SanItem{2, name})
 	}
 	for _, name := range req.IPAddresses {
-		items = append(items, sanItem{7, name.String()})
+		items = append(items, tpp_structs.SanItem{7, name.String()})
 	}
 	for _, name := range req.URIs {
-		items = append(items, sanItem{6, name.String()})
+		items = append(items, tpp_structs.SanItem{6, name.String()})
 	}
 	for _, name := range req.UPNs {
-		items = append(items, sanItem{0, name})
+		items = append(items, tpp_structs.SanItem{0, name})
 	}
 	return items
 }
 
-func prepareLegacyMetadata(c *Connector, metaItems []customField, dn string) ([]guidData, error) {
+func prepareLegacyMetadata(c *Connector, metaItems []tpp_structs.CustomField, dn string) ([]tpp_structs.GuidData, error) {
 	metadataItems, err := c.requestAllMetadataItems(dn)
 	if nil != err {
 		return nil, err
@@ -395,111 +327,64 @@ func prepareLegacyMetadata(c *Connector, metaItems []customField, dn string) ([]
 		customFieldsGUIDMap[item.Label] = item.Guid
 	}
 
-	var requestGUIDData []guidData
+	var requestGUIDData []tpp_structs.GuidData
 	for _, item := range metaItems {
 		guid, prs := customFieldsGUIDMap[item.Name]
 		if prs {
-			requestGUIDData = append(requestGUIDData, guidData{guid, item.Values})
+			requestGUIDData = append(requestGUIDData, tpp_structs.GuidData{guid, item.Values})
 		}
 	}
 	return requestGUIDData, nil
 }
 
 // requestAllMetadataItems returns all possible metadata items for a DN
-func (c *Connector) requestAllMetadataItems(dn string) ([]metadataItem, error) {
-	statusCode, status, body, err := c.request("POST", urlResourceAllMetadataGet, metadataGetItemsRequest{dn})
-	if err != nil {
-		return nil, err
-	}
-	if statusCode != http.StatusOK {
-		return nil, fmt.Errorf("Unexpected http status code while fetching metadata items. %d-%s", statusCode, status)
-	}
+func (c *Connector) requestAllMetadataItems(dn string) ([]tpp_structs.MetadataItem, error) {
+	response, err := c.rawClient().PostMetadataGetAll(&tpp_structs.MetadataGetItemsRequest{dn})
 
-	var response metadataGetItemsResponse
-	err = json.Unmarshal(body, &response)
 	return response.Items, err
 }
 
 // requestMetadataItems returns metadata items for a DN that have a value stored
-func (c *Connector) requestMetadataItems(dn string) ([]metadataKeyValueSet, error) {
-	statusCode, status, body, err := c.request("POST", urlResourceMetadataGet, metadataGetItemsRequest{dn})
-	if err != nil {
-		return nil, err
-	}
-	if statusCode != http.StatusOK {
-		return nil, fmt.Errorf("Unexpected http status code while fetching certificate metadata items. %d-%s", statusCode, status)
-	}
-	var response metadataGetResponse
-	err = json.Unmarshal(body, &response)
+func (c *Connector) requestMetadataItems(dn string) ([]tpp_structs.MetadataKeyValueSet, error) {
+	response, err := c.rawClient().PostMetadataGet(&tpp_structs.MetadataGetItemsRequest{dn})
+
 	return response.Data, err
 }
 
 // Retrieve user's self identity
-func (c *Connector) retrieveSelfIdentity() (response identity, err error) {
-
-	var respIndentities = &identitiesResponse{}
-
-	statusCode, statusText, body, err := c.request("GET", urlRetrieveSelfIdentity, nil)
+func (c *Connector) retrieveSelfIdentity() (response tpp_structs.Identity, err error) {
+	respIndentities, err := c.rawClient().GetIdentitySelf()
 	if err != nil {
 		log.Printf("Failed to get the used user. Error: %v", err)
-		return identity{}, err
+		return tpp_structs.Identity{}, err
 	}
 
-	switch statusCode {
-	case http.StatusOK:
-		err = json.Unmarshal(body, respIndentities)
-		if err != nil {
-			return identity{}, fmt.Errorf("failed to parse identity response: %s, body: %s", err, body)
-		}
-
-		if (respIndentities != nil) && (len(respIndentities.Identities) > 0) {
-			return respIndentities.Identities[0], nil
-		}
-	case http.StatusUnauthorized:
-		return identity{}, verror.AuthError
+	if len(respIndentities.Identities) == 0 {
+		return tpp_structs.Identity{}, fmt.Errorf("failed to get Self. server returned an empty set of identities")
 	}
-	return identity{}, fmt.Errorf("failed to get Self. Status code: %d, Status text: %s", statusCode, statusText)
+
+	return respIndentities.Identities[0], nil
 }
 
 // requestSystemVersion returns the TPP system version of the connector context
 func (c *Connector) RetrieveSystemVersion() (string, error) {
-	statusCode, status, body, err := c.request("GET", urlResourceSystemStatusVersion, "")
-	if err != nil {
-		return "", err
-	}
-	//Put in hint for authentication scope 'configuration'
-	switch statusCode {
-	case 200:
-	case 401:
-		return "", fmt.Errorf("http status code '%s' was returned by the server. Hint: OAuth scope 'configuration' is required when using custom fields", status)
-	default:
-		return "", fmt.Errorf("Unexpected http status code while fetching TPP version. %s", status)
-	}
+	response, err := c.rawClient().GetSystemStatusVersion()
 
-	var response struct{ Version string }
-	err = json.Unmarshal(body, &response)
 	return response.Version, err
 }
 
 // setCertificateMetadata submits the metadata to TPP for storage returning the lock status of the metadata stored
-func (c *Connector) setCertificateMetadata(metadataRequest metadataSetRequest) (bool, error) {
+func (c *Connector) setCertificateMetadata(metadataRequest tpp_structs.MetadataSetRequest) (bool, error) {
 	if metadataRequest.DN == "" {
 		return false, fmt.Errorf("DN must be provided to setCertificateMetaData")
 	}
+
 	if len(metadataRequest.GuidData) == 0 && metadataRequest.KeepExisting {
+		// Not an error, but there is nothing to do
 		return false, nil
-	} //Not an error, but there is nothing to do
-
-	statusCode, status, body, err := c.request("POST", urlResourceMetadataSet, metadataRequest)
-	if err != nil {
-		return false, err
-	}
-	if statusCode != http.StatusOK {
-		return false, fmt.Errorf("Unexpected http status code while setting metadata items. %d-%s", statusCode, status)
 	}
 
-	var result = metadataSetResponse{}
-	err = json.Unmarshal(body, &result)
+	result, err := c.rawClient().PostMetadataSet(&metadataRequest)
 	if err != nil {
 		return false, err
 	}
@@ -515,7 +400,7 @@ func (c *Connector) setCertificateMetadata(metadataRequest metadataSetRequest) (
 	return result.Locked, nil
 }
 
-func prepareRequest(req *certificate.Request, zone string) (tppReq certificateRequest, err error) {
+func prepareRequest(req *certificate.Request, zone string) (tppReq tpp_structs.CertificateRequest, err error) {
 	switch req.CsrOrigin {
 	case certificate.LocalGeneratedCSR, certificate.UserProvidedCSR:
 		tppReq.PKCS10 = string(req.GetCSR())
@@ -543,7 +428,7 @@ func prepareRequest(req *certificate.Request, zone string) (tppReq certificateRe
 			origin = f.Value
 		}
 	}
-	tppReq.CASpecificAttributes = append(tppReq.CASpecificAttributes, nameValuePair{Name: "Origin", Value: origin})
+	tppReq.CASpecificAttributes = append(tppReq.CASpecificAttributes, tpp_structs.NameValuePair{Name: "Origin", Value: origin})
 	tppReq.Origin = origin
 
 	if req.ValidityHours > 0 {
@@ -578,11 +463,11 @@ func prepareRequest(req *certificate.Request, zone string) (tppReq certificateRe
 		formattedExpirationDate := fmt.Sprintf("%d-%02d-%02d %02d:%02d:%02d",
 			expirationDate.Year(), expirationDate.Month(), expirationDate.Day(), expirationDate.Hour(), expirationDate.Minute(), expirationDate.Second())
 
-		tppReq.CASpecificAttributes = append(tppReq.CASpecificAttributes, nameValuePair{Name: expirationDateAttribute, Value: formattedExpirationDate})
+		tppReq.CASpecificAttributes = append(tppReq.CASpecificAttributes, tpp_structs.NameValuePair{Name: expirationDateAttribute, Value: formattedExpirationDate})
 	}
 
 	for name, value := range customFieldsMap {
-		tppReq.CustomFields = append(tppReq.CustomFields, customField{name, value})
+		tppReq.CustomFields = append(tppReq.CustomFields, tpp_structs.CustomField{name, value})
 	}
 	if req.Location != nil {
 		if req.Location.Instance == "" {
@@ -592,11 +477,11 @@ func prepareRequest(req *certificate.Request, zone string) (tppReq certificateRe
 		if workload == "" {
 			workload = defaultWorkloadName
 		}
-		dev := device{
+		dev := tpp_structs.Device{
 			PolicyDN:   getPolicyDN(zone),
 			ObjectName: req.Location.Instance,
 			Host:       req.Location.Instance,
-			Applications: []application{
+			Applications: []tpp_structs.Application{
 				{
 					ObjectName: workload,
 					Class:      "Basic",
@@ -690,14 +575,12 @@ func (c *Connector) RequestCertificate(req *certificate.Request) (requestID stri
 	if err != nil {
 		return "", err
 	}
-	statusCode, status, body, err := c.request("POST", urlResourceCertificateRequest, tppCertificateRequest)
+
+	response, err := c.rawClient().PostCertificateRequest(&tppCertificateRequest)
 	if err != nil {
 		return "", err
 	}
-	requestID, err = parseRequestResult(statusCode, status, body)
-	if err != nil {
-		return "", err
-	}
+	requestID = response.CertificateDN
 	req.PickupID = requestID
 
 	if len(req.CustomFields) == 0 {
@@ -749,7 +632,7 @@ func (c *Connector) RequestCertificate(req *certificate.Request) (requestID stri
 		log.Println(err)
 		return
 	}
-	requestData := metadataSetRequest{requestID, guidItems, true}
+	requestData := tpp_structs.MetadataSetRequest{requestID, guidItems, true}
 	//c.request with the metadata request
 	_, err = c.setCertificateMetadata(requestData)
 	if err != nil {
@@ -760,7 +643,7 @@ func (c *Connector) RequestCertificate(req *certificate.Request) (requestID stri
 
 func (c *Connector) GetPolicy(name string) (*policy.PolicySpecification, error) {
 	var ps *policy.PolicySpecification
-	var tp policy.TppPolicy
+	var tp tpp_structs.TppPolicy
 
 	log.Println("Collecting policy attributes")
 
@@ -775,18 +658,11 @@ func (c *Connector) GetPolicy(name string) (*policy.PolicySpecification, error) 
 
 	tp.Name = &name
 
-	var checkPolicyResponse policy.CheckPolicyResponse
-
-	req := policy.CheckPolicyRequest{
+	req := tpp_structs.CheckPolicyRequest{
 		PolicyDN: name,
 	}
-	_, _, body, err := c.request("POST", urlResourceCheckPolicy, req)
 
-	if err != nil {
-		return nil, err
-	}
-
-	err = json.Unmarshal(body, &checkPolicyResponse)
+	checkPolicyResponse, err := c.rawClient().PostCertificateCheckPolicy(&req)
 	if err != nil {
 		return nil, err
 	}
@@ -796,7 +672,7 @@ func (c *Connector) GetPolicy(name string) (*policy.PolicySpecification, error) 
 	}
 
 	log.Println("Building policy")
-	ps, err = policy.BuildPolicySpecificationForTPP(checkPolicyResponse)
+	ps, err = tpp_convert.BuildPolicySpecificationForTPP(*checkPolicyResponse)
 	if err != nil {
 		return nil, err
 	}
@@ -811,15 +687,15 @@ func (c *Connector) GetPolicy(name string) (*policy.PolicySpecification, error) 
 }
 
 func (c *Connector) retrieveUserNamesForPolicySpecification(policyName string) ([]string, error) {
-	values, _, error := getPolicyAttribute(c, policy.TppContact, policyName)
+	values, _, error := getPolicyAttribute(c, tpp_structs.TppContact, policyName)
 	if error != nil {
 		return nil, error
 	}
 	if values != nil {
 		var users []string
 		for _, prefixedUniversal := range values {
-			validateIdentityRequest := policy.ValidateIdentityRequest{
-				ID: policy.IdentityInformation{
+			validateIdentityRequest := tpp_structs.ValidateIdentityRequest{
+				ID: tpp_structs.IdentityInformation{
 					PrefixedUniversal: prefixedUniversal,
 				},
 			}
@@ -838,32 +714,20 @@ func (c *Connector) retrieveUserNamesForPolicySpecification(policyName string) (
 	return nil, nil
 }
 
-func (c *Connector) validateIdentity(validateIdentityRequest policy.ValidateIdentityRequest) (*policy.ValidateIdentityResponse, error) {
-
-	statusCode, status, body, err := c.request("POST", urlResourceValidateIdentity, validateIdentityRequest)
+func (c *Connector) validateIdentity(validateIdentityRequest tpp_structs.ValidateIdentityRequest) (*tpp_structs.ValidateIdentityResponse, error) {
+	validateIdentityResponse, err := c.rawClient().PostIdentityValidate(validateIdentityRequest)
 	if err != nil {
 		return nil, err
 	}
-	validateIdentityResponse, err := parseValidateIdentityResponse(statusCode, status, body)
-	if err != nil {
-		return nil, err
-	}
-	return &validateIdentityResponse, nil
+	return validateIdentityResponse, nil
 }
 
 func PolicyExist(policyName string, c *Connector) (bool, error) {
-
-	req := policy.PolicyExistPayloadRequest{
+	req := tpp_structs.PolicyExistPayloadRequest{
 		ObjectDN: policyName,
 	}
-	_, _, body, err := c.request("POST", urlResourceIsValidPolicy, req)
 
-	if err != nil {
-		return false, err
-	}
-	var response policy.PolicyIsValidResponse
-	err = json.Unmarshal(body, &response)
-
+	response, err := c.rawClient().PostConfigIsValidPolicy(&req)
 	if err != nil {
 		return false, err
 	}
@@ -880,9 +744,8 @@ func PolicyExist(policyName string, c *Connector) (bool, error) {
 }
 
 func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (string, error) {
-
 	//validate policy specification and policy
-	err := policy.ValidateTppPolicySpecification(ps)
+	err := tpp_validate.ValidateTppPolicySpecification(ps)
 
 	if err != nil {
 		return "", err
@@ -890,7 +753,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	log.Printf("policy specification is valid")
 	var status string
-	tppPolicy := policy.BuildTppPolicy(ps)
+	tppPolicy := tpp_convert.BuildTppPolicy(ps)
 	if !strings.HasPrefix(name, util.PathSeparator) {
 		name = util.PathSeparator + name
 	}
@@ -932,13 +795,12 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 		log.Printf("creating policy folder: %s", name)
 
-		req := policy.PolicyPayloadRequest{
+		req := tpp_structs.PolicyPayloadRequest{
 			Class:    policy.PolicyClass,
 			ObjectDN: *(tppPolicy.Name),
 		}
 
-		_, _, _, err = c.request("POST", urlResourceCreatePolicy, req)
-
+		err := c.rawClient().PostConfigCreatePolicy(&req)
 		if err != nil {
 			return "", err
 		}
@@ -949,7 +811,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create Approver
 	if tppPolicy.Approver != nil {
-		_, _, _, err = createPolicyAttribute(c, policy.TppApprover, tppPolicy.Approver, *(tppPolicy.Name), true)
+		err = createPolicyAttribute(c, tpp_structs.TppApprover, tppPolicy.Approver, *(tppPolicy.Name), true)
 		if err != nil {
 			return "", err
 		}
@@ -969,7 +831,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create Domain Suffix Whitelist
 	if tppPolicy.ManagementType != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppManagementType, []string{tppPolicy.ManagementType.Value}, *(tppPolicy.Name), tppPolicy.ManagementType.Locked)
+		err = createPolicyAttribute(c, tpp_structs.TppManagementType, []string{tppPolicy.ManagementType.Value}, *(tppPolicy.Name), tppPolicy.ManagementType.Locked)
 		if err != nil {
 			return "", err
 		}
@@ -977,7 +839,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create Domain Suffix Whitelist
 	if tppPolicy.DomainSuffixWhitelist != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppDomainSuffixWhitelist, tppPolicy.DomainSuffixWhitelist, *(tppPolicy.Name), true)
+		err = createPolicyAttribute(c, tpp_structs.TppDomainSuffixWhitelist, tppPolicy.DomainSuffixWhitelist, *(tppPolicy.Name), true)
 		if err != nil {
 			return "", err
 		}
@@ -985,7 +847,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create Prohibit Wildcard
 	if tppPolicy.ProhibitWildcard != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppProhibitWildcard, []string{strconv.Itoa(*(tppPolicy.ProhibitWildcard))}, *(tppPolicy.Name), false)
+		err = createPolicyAttribute(c, tpp_structs.TppProhibitWildcard, []string{strconv.Itoa(*(tppPolicy.ProhibitWildcard))}, *(tppPolicy.Name), false)
 		if err != nil {
 			return "", err
 		}
@@ -993,7 +855,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create Certificate Authority
 	if tppPolicy.CertificateAuthority != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppCertificateAuthority, []string{*(tppPolicy.CertificateAuthority)}, *(tppPolicy.Name), false)
+		err = createPolicyAttribute(c, tpp_structs.TppCertificateAuthority, []string{*(tppPolicy.CertificateAuthority)}, *(tppPolicy.Name), false)
 		if err != nil {
 			return "", err
 		}
@@ -1001,7 +863,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create Organization attribute
 	if tppPolicy.Organization != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppOrganization, []string{tppPolicy.Organization.Value}, *(tppPolicy.Name), tppPolicy.Organization.Locked)
+		err = createPolicyAttribute(c, tpp_structs.TppOrganization, []string{tppPolicy.Organization.Value}, *(tppPolicy.Name), tppPolicy.Organization.Locked)
 		if err != nil {
 			return "", err
 		}
@@ -1009,14 +871,14 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create Organizational Unit attribute
 	if tppPolicy.OrganizationalUnit != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppOrganizationalUnit, tppPolicy.OrganizationalUnit.Value, *(tppPolicy.Name), tppPolicy.OrganizationalUnit.Locked)
+		err = createPolicyAttribute(c, tpp_structs.TppOrganizationalUnit, tppPolicy.OrganizationalUnit.Value, *(tppPolicy.Name), tppPolicy.OrganizationalUnit.Locked)
 		if err != nil {
 			return "", err
 		}
 	}
 	//create City attribute
 	if tppPolicy.City != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppCity, []string{tppPolicy.City.Value}, *(tppPolicy.Name), tppPolicy.City.Locked)
+		err = createPolicyAttribute(c, tpp_structs.TppCity, []string{tppPolicy.City.Value}, *(tppPolicy.Name), tppPolicy.City.Locked)
 		if err != nil {
 			return "", err
 		}
@@ -1024,7 +886,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create State attribute
 	if tppPolicy.State != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppState, []string{tppPolicy.State.Value}, *(tppPolicy.Name), tppPolicy.State.Locked)
+		err = createPolicyAttribute(c, tpp_structs.TppState, []string{tppPolicy.State.Value}, *(tppPolicy.Name), tppPolicy.State.Locked)
 		if err != nil {
 			return "", err
 		}
@@ -1032,7 +894,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create Country attribute
 	if tppPolicy.Country != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppCountry, []string{tppPolicy.Country.Value}, *(tppPolicy.Name), tppPolicy.Country.Locked)
+		err = createPolicyAttribute(c, tpp_structs.TppCountry, []string{tppPolicy.Country.Value}, *(tppPolicy.Name), tppPolicy.Country.Locked)
 		if err != nil {
 			return "", err
 		}
@@ -1040,7 +902,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create Key Algorithm attribute
 	if tppPolicy.KeyAlgorithm != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppKeyAlgorithm, []string{tppPolicy.KeyAlgorithm.Value}, *(tppPolicy.Name), tppPolicy.KeyAlgorithm.Locked)
+		err = createPolicyAttribute(c, tpp_structs.TppKeyAlgorithm, []string{tppPolicy.KeyAlgorithm.Value}, *(tppPolicy.Name), tppPolicy.KeyAlgorithm.Locked)
 		if err != nil {
 			return "", err
 		}
@@ -1048,7 +910,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create Key Bit Strength
 	if tppPolicy.KeyBitStrength != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppKeyBitStrength, []string{tppPolicy.KeyBitStrength.Value}, *(tppPolicy.Name), tppPolicy.KeyBitStrength.Locked)
+		err = createPolicyAttribute(c, tpp_structs.TppKeyBitStrength, []string{tppPolicy.KeyBitStrength.Value}, *(tppPolicy.Name), tppPolicy.KeyBitStrength.Locked)
 		if err != nil {
 			return "", err
 		}
@@ -1056,7 +918,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create Elliptic Curve attribute
 	if tppPolicy.EllipticCurve != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppEllipticCurve, []string{tppPolicy.EllipticCurve.Value}, *(tppPolicy.Name), tppPolicy.EllipticCurve.Locked)
+		err = createPolicyAttribute(c, tpp_structs.TppEllipticCurve, []string{tppPolicy.EllipticCurve.Value}, *(tppPolicy.Name), tppPolicy.EllipticCurve.Locked)
 		if err != nil {
 			return "", err
 		}
@@ -1064,14 +926,14 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//create Manual Csr attribute
 	if tppPolicy.ManualCsr != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.ServiceGenerated, []string{tppPolicy.ManualCsr.Value}, *(tppPolicy.Name), tppPolicy.ManualCsr.Locked)
+		err = createPolicyAttribute(c, tpp_structs.TppManualCSR, []string{tppPolicy.ManualCsr.Value}, *(tppPolicy.Name), tppPolicy.ManualCsr.Locked)
 		if err != nil {
 			return "", err
 		}
 	}
 
 	if tppPolicy.ProhibitedSANType != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppProhibitedSANTypes, tppPolicy.ProhibitedSANType, *(tppPolicy.Name), false)
+		err = createPolicyAttribute(c, tpp_structs.TppProhibitedSANTypes, tppPolicy.ProhibitedSANType, *(tppPolicy.Name), false)
 		if err != nil {
 			return "", err
 		}
@@ -1079,14 +941,14 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 
 	//Allow Private Key Reuse" & "Want Renewal
 	if tppPolicy.AllowPrivateKeyReuse != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppAllowPrivateKeyReuse, []string{strconv.Itoa(*(tppPolicy.AllowPrivateKeyReuse))}, *(tppPolicy.Name), true)
+		err = createPolicyAttribute(c, tpp_structs.TppAllowPrivateKeyReuse, []string{strconv.Itoa(*(tppPolicy.AllowPrivateKeyReuse))}, *(tppPolicy.Name), true)
 		if err != nil {
 			return "", err
 		}
 	}
 
 	if tppPolicy.WantRenewal != nil {
-		_, status, _, err = createPolicyAttribute(c, policy.TppWantRenewal, []string{strconv.Itoa(*(tppPolicy.WantRenewal))}, *(tppPolicy.Name), true)
+		err = createPolicyAttribute(c, tpp_structs.TppWantRenewal, []string{strconv.Itoa(*(tppPolicy.WantRenewal))}, *(tppPolicy.Name), true)
 		if err != nil {
 			return "", err
 		}
@@ -1097,8 +959,7 @@ func (c *Connector) SetPolicy(name string, ps *policy.PolicySpecification) (stri
 	return status, nil
 }
 
-func (c *Connector) setContact(tppPolicy *policy.TppPolicy) (status string, err error) {
-
+func (c *Connector) setContact(tppPolicy *tpp_structs.TppPolicy) (status string, err error) {
 	if tppPolicy.Contact != nil {
 		contacts, err := c.resolveContacts(tppPolicy.Contact)
 		if err != nil {
@@ -1107,7 +968,7 @@ func (c *Connector) setContact(tppPolicy *policy.TppPolicy) (status string, err 
 		if contacts != nil {
 			tppPolicy.Contact = contacts
 
-			_, status, _, err = createPolicyAttribute(c, policy.TppContact, tppPolicy.Contact, *(tppPolicy.Name), true)
+			err = createPolicyAttribute(c, tpp_structs.TppContact, tppPolicy.Contact, *(tppPolicy.Name), true)
 			if err != nil {
 				return "", err
 			}
@@ -1143,12 +1004,12 @@ func getUniqueStringSlice(stringSlice []string) []string {
 	return list
 }
 
-func (c *Connector) getIdentity(userName string) (*policy.IdentityEntry, error) {
+func (c *Connector) getIdentity(userName string) (*tpp_structs.Identity, error) {
 	if userName == "" {
 		return nil, fmt.Errorf("identity string cannot be null")
 	}
 
-	req := policy.BrowseIdentitiesRequest{
+	req := tpp_structs.BrowseIdentitiesRequest{
 		Filter:       userName,
 		Limit:        2,
 		IdentityType: policy.AllIdentities,
@@ -1162,8 +1023,8 @@ func (c *Connector) getIdentity(userName string) (*policy.IdentityEntry, error) 
 	return c.getIdentityMatching(resp.Identities, userName)
 }
 
-func (c *Connector) getIdentityMatching(identities []policy.IdentityEntry, identityName string) (*policy.IdentityEntry, error) {
-	var identityEntryMatching *policy.IdentityEntry
+func (c *Connector) getIdentityMatching(identities []tpp_structs.Identity, identityName string) (*tpp_structs.Identity, error) {
+	var identityEntryMatching *tpp_structs.Identity
 
 	if len(identities) > 0 {
 		for i := range identities {
@@ -1183,17 +1044,12 @@ func (c *Connector) getIdentityMatching(identities []policy.IdentityEntry, ident
 	}
 }
 
-func (c *Connector) browseIdentities(browseReq policy.BrowseIdentitiesRequest) (*policy.BrowseIdentitiesResponse, error) {
-
-	statusCode, status, body, err := c.request("POST", urlResourceBrowseIdentities, browseReq)
+func (c *Connector) browseIdentities(browseReq tpp_structs.BrowseIdentitiesRequest) (*tpp_structs.BrowseIdentitiesResponse, error) {
+	browseIdentitiesResponse, err := c.rawClient().PostIdentityBrowse(browseReq)
 	if err != nil {
 		return nil, err
 	}
-	browseIdentitiesResponse, err := parseBrowseIdentitiesResult(statusCode, status, body)
-	if err != nil {
-		return nil, err
-	}
-	return &browseIdentitiesResponse, nil
+	return browseIdentitiesResponse, nil
 }
 
 // RetrieveCertificate attempts to retrieve the requested certificate
@@ -1214,10 +1070,10 @@ func (c *Connector) RetrieveCertificate(req *certificate.Request) (certificates 
 		if len(searchResult.Certificates) > 1 {
 			return nil, fmt.Errorf("Error: more than one CertificateRequestId was found with the same thumbprint")
 		}
-		req.PickupID = searchResult.Certificates[0].CertificateRequestId
+		req.PickupID = searchResult.Certificates[0].DN
 	}
 
-	certReq := certificateRetrieveRequest{
+	certReq := tpp_structs.CertificateRetrieveRequest{
 		CertificateDN:  req.PickupID,
 		Format:         "base64",
 		RootFirstOrder: rootFirstOrder,
@@ -1233,7 +1089,7 @@ func (c *Connector) RetrieveCertificate(req *certificate.Request) (certificates 
 
 	startTime := time.Now()
 	for {
-		var retrieveResponse *certificateRetrieveResponse
+		var retrieveResponse *tpp_structs.CertificateRetrieveResponse
 		retrieveResponse, err = c.retrieveCertificateOnce(certReq)
 		if err != nil {
 			return nil, fmt.Errorf("unable to retrieve: %s", err)
@@ -1256,31 +1112,20 @@ func (c *Connector) RetrieveCertificate(req *certificate.Request) (certificates 
 	}
 }
 
-func (c *Connector) retrieveCertificateOnce(certReq certificateRetrieveRequest) (*certificateRetrieveResponse, error) {
-	statusCode, status, body, err := c.request("POST", urlResourceCertificateRetrieve, certReq)
+func (c *Connector) retrieveCertificateOnce(certReq tpp_structs.CertificateRetrieveRequest) (*tpp_structs.CertificateRetrieveResponse, error) {
+	retrieveResponse, err := c.rawClient().PostCertificateRetrieve(&certReq)
 	if err != nil {
 		return nil, err
 	}
-	retrieveResponse, err := parseRetrieveResult(statusCode, status, body)
-	if err != nil {
-		return nil, err
-	}
-	return &retrieveResponse, nil
+	return retrieveResponse, nil
 }
 
-func (c *Connector) putCertificateInfo(dn string, attributes []nameSliceValuePair) error {
+func (c *Connector) putCertificateInfo(dn string, attributes []tpp_structs.NameSliceValuePair) error {
 	guid, err := c.configDNToGuid(dn)
 	if err != nil {
 		return err
 	}
-	statusCode, _, _, err := c.request("PUT", urlResourceCertificate+urlResource(guid), struct{ AttributeData []nameSliceValuePair }{attributes})
-	if err != nil {
-		return err
-	}
-	if statusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %v", statusCode)
-	}
-	return nil
+	return c.rawClient().PutCertificate(guid, &tpp_structs.CertificateInfo{AttributeData: attributes})
 }
 
 func (c *Connector) prepareRenewalRequest(renewReq *certificate.RenewalRequest) error {
@@ -1327,7 +1172,7 @@ func (c *Connector) RenewCertificate(renewReq *certificate.RenewalRequest) (requ
 			return "", fmt.Errorf("Error: more than one CertificateRequestId was found with the same thumbprint")
 		}
 
-		renewReq.CertificateDN = searchResult.Certificates[0].CertificateRequestId
+		renewReq.CertificateDN = searchResult.Certificates[0].DN
 	}
 	if renewReq.CertificateDN == "" {
 		return "", fmt.Errorf("failed to create renewal request: CertificateDN or Thumbprint required")
@@ -1335,7 +1180,7 @@ func (c *Connector) RenewCertificate(renewReq *certificate.RenewalRequest) (requ
 	if renewReq.CertificateRequest != nil && renewReq.CertificateRequest.OmitSANs {
 		// if OmitSANSs flag is presented we need to clean SANs values in TPP
 		// for preventing adding them to renew request on TPP side
-		err = c.putCertificateInfo(renewReq.CertificateDN, []nameSliceValuePair{
+		err = c.putCertificateInfo(renewReq.CertificateDN, []tpp_structs.NameSliceValuePair{
 			{"X509 SubjectAltName DNS", nil},
 			{"X509 SubjectAltName IPAddress", nil},
 			{"X509 SubjectAltName RFC822", nil},
@@ -1350,24 +1195,32 @@ func (c *Connector) RenewCertificate(renewReq *certificate.RenewalRequest) (requ
 	//if err != nil {
 	//	return "", err
 	//}
-	var r = certificateRenewRequest{}
+	var r = tpp_structs.CertificateRenewRequest{}
 	r.CertificateDN = renewReq.CertificateDN
 	if renewReq.CertificateRequest != nil && len(renewReq.CertificateRequest.GetCSR()) != 0 {
 		r.PKCS10 = string(renewReq.CertificateRequest.GetCSR())
 	}
-	statusCode, status, body, err := c.request("POST", urlResourceCertificateRenew, r)
+
+	response, err := c.rawClient().PostCertificateRenew(&r)
 	if err != nil {
 		return "", err
 	}
 
-	response, err := parseRenewResult(statusCode, status, body)
-	if err != nil {
-		return "", err
-	}
 	if !response.Success {
 		return "", fmt.Errorf("Certificate Renewal error: %s", response.Error)
 	}
 	return renewReq.CertificateDN, nil
+}
+
+// RevocationReasonsMap maps *certificate.RevocationRequest.Reason to TPP-specific webSDK codes
+var RevocationReasonsMap = map[string]tpp_structs.RevocationReason{
+	"":                       0, // NoReason
+	"none":                   0, //
+	"key-compromise":         1, // UserKeyCompromised
+	"ca-compromise":          2, // CAKeyCompromised
+	"affiliation-changed":    3, // UserChangedAffiliation
+	"superseded":             4, // CertificateSuperseded
+	"cessation-of-operation": 5, // OriginalUseNoLongerValid
 }
 
 // RevokeCertificate attempts to revoke the certificate
@@ -1377,18 +1230,15 @@ func (c *Connector) RevokeCertificate(revReq *certificate.RevocationRequest) (er
 		return fmt.Errorf("could not parse revocation reason `%s`", revReq.Reason)
 	}
 
-	var r = certificateRevokeRequest{
+	var r = tpp_structs.CertificateRevokeRequest{
 		revReq.CertificateDN,
 		revReq.Thumbprint,
 		reason,
 		revReq.Comments,
 		revReq.Disable,
 	}
-	statusCode, status, body, err := c.request("POST", urlResourceCertificateRevoke, r)
-	if err != nil {
-		return err
-	}
-	revokeResponse, err := parseRevokeResult(statusCode, status, body)
+
+	revokeResponse, err := c.rawClient().PostCertificateRevoke(&r)
 	if err != nil {
 		return
 	}
@@ -1400,38 +1250,19 @@ func (c *Connector) RevokeCertificate(revReq *certificate.RevocationRequest) (er
 
 var zoneNonFoundregexp = regexp.MustCompile("PolicyDN: .+ does not exist")
 
-func (c *Connector) ReadPolicyConfiguration() (policy *endpoint.Policy, err error) {
+func (c *Connector) ReadPolicyConfiguration() (*endpoint.Policy, error) {
 	if c.zone == "" {
 		return nil, fmt.Errorf("empty zone")
 	}
-	rq := struct{ PolicyDN string }{getPolicyDN(c.zone)}
-	statusCode, status, body, err := c.request("POST", urlResourceCertificatePolicy, rq)
+
+	result, err := c.rawClient().PostCertificateCheckPolicy(&tpp_structs.CheckPolicyRequest{PolicyDN: getPolicyDN(c.zone)})
 	if err != nil {
-		return
+		return nil, err
 	}
-	var r struct {
-		Policy serverPolicy
-		Error  string
-	}
-	if statusCode == http.StatusOK {
-		err = json.Unmarshal(body, &r)
-		if err != nil {
-			return nil, err
-		}
-		p := r.Policy.toPolicy()
-		policy = &p
-	} else if statusCode == http.StatusBadRequest {
-		err = json.Unmarshal(body, &r)
-		if err != nil {
-			return nil, err
-		}
-		if zoneNonFoundregexp.Match([]byte(r.Error)) {
-			return nil, verror.ZoneNotFoundError
-		}
-	} else {
-		return nil, fmt.Errorf("Invalid status: %s Server data: %s", status, body)
-	}
-	return
+
+	p := serverPolicyToPolicy(*result.Policy)
+
+	return &p, err
 }
 
 // ReadZoneConfiguration reads the policy data from TPP to get locked and pre-configured values for certificate requests
@@ -1441,39 +1272,21 @@ func (c *Connector) ReadZoneConfiguration() (config *endpoint.ZoneConfiguration,
 	}
 	zoneConfig := endpoint.NewZoneConfiguration()
 	zoneConfig.HashAlgorithm = x509.SHA256WithRSA //todo: check this can have problem with ECDSA key
-	rq := struct{ PolicyDN string }{getPolicyDN(c.zone)}
-	statusCode, status, body, err := c.request("POST", urlResourceCertificatePolicy, rq)
+
+	result, err := c.rawClient().PostCertificateCheckPolicy(&tpp_structs.CheckPolicyRequest{PolicyDN: getPolicyDN(c.zone)})
 	if err != nil {
 		return
 	}
-	var r struct {
-		Policy serverPolicy
-		Error  string
-	}
-	if statusCode == http.StatusOK {
-		err = json.Unmarshal(body, &r)
-		if err != nil {
-			return nil, err
-		}
-		p := r.Policy.toPolicy()
-		r.Policy.toZoneConfig(zoneConfig)
-		zoneConfig.Policy = p
-		return zoneConfig, nil
-	} else if statusCode == http.StatusBadRequest {
-		err = json.Unmarshal(body, &r)
-		if err != nil {
-			return nil, err
-		}
-		if zoneNonFoundregexp.Match([]byte(r.Error)) {
-			return nil, verror.ZoneNotFoundError
-		}
-	}
-	return nil, fmt.Errorf("Invalid status: %s Server response: %s", status, string(body))
 
+	p := serverPolicyToPolicy(*result.Policy)
+	serverPolicyToZoneConfig(*result.Policy, zoneConfig)
+	zoneConfig.Policy = p
+
+	return zoneConfig, nil
 }
 
 func (c *Connector) ImportCertificate(req *certificate.ImportRequest) (*certificate.ImportResponse, error) {
-	r := importRequest{
+	r := tpp_structs.ImportRequest{
 		PolicyDN:        req.PolicyDN,
 		ObjectName:      req.ObjectName,
 		CertificateData: req.CertificateData,
@@ -1492,48 +1305,21 @@ func (c *Connector) ImportCertificate(req *certificate.ImportRequest) (*certific
 			origin = f.Value + " (+)"
 		}
 	}
-	statusCode, _, body, err := c.request("POST", urlResourceCertificateImport, r)
+
+	response, err := c.rawClient().PostCertificateImport(&r)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", verror.ServerTemporaryUnavailableError, err)
+		return nil, err
 	}
-	switch statusCode {
-	case http.StatusOK:
-		var response = &certificate.ImportResponse{}
-		err := json.Unmarshal(body, response)
-		if err != nil {
-			return nil, fmt.Errorf("%w: failed to decode import response message: %s", verror.ServerError, err)
-		}
-		err = c.putCertificateInfo(response.CertificateDN, []nameSliceValuePair{{Name: "Origin", Value: []string{origin}}})
-		if err != nil {
-			log.Println(err)
-		}
-		return response, nil
-	case http.StatusBadRequest:
-		var errorResponse = &struct{ Error string }{}
-		err := json.Unmarshal(body, errorResponse)
-		if err != nil {
-			return nil, fmt.Errorf("%w: failed to decode error message: %s", verror.ServerBadDataResponce, err)
-		}
-		return nil, fmt.Errorf("%w: can't import certificate %s", verror.ServerBadDataResponce, errorResponse.Error)
-	default:
-		return nil, fmt.Errorf("%w: unexpected response status %d: %s", verror.ServerTemporaryUnavailableError, statusCode, string(body))
+
+	err = c.putCertificateInfo(response.CertificateDN, []tpp_structs.NameSliceValuePair{{Name: "Origin", Value: []string{origin}}})
+	if err != nil {
+		log.Println(err)
 	}
+	return response, nil
 }
 
 func (c *Connector) SearchCertificates(req *certificate.SearchRequest) (*certificate.CertSearchResponse, error) {
-
-	var err error
-
-	url := fmt.Sprintf("%s?%s", urlResourceCertificateSearch, strings.Join(*req, "&"))
-	statusCode, _, body, err := c.request("GET", urlResource(url), nil)
-	if err != nil {
-		return nil, err
-	}
-	searchResult, err := ParseCertificateSearchResponse(statusCode, body)
-	if err != nil {
-		return nil, err
-	}
-	return searchResult, nil
+	return c.rawClient().GetCertificate(*req)
 }
 
 func (c *Connector) SearchCertificate(zone string, cn string, sans *certificate.Sans, certMinTimeLeft time.Duration) (certificateInfo *certificate.CertificateInfo, err error) {
@@ -1541,12 +1327,7 @@ func (c *Connector) SearchCertificate(zone string, cn string, sans *certificate.
 	req := formatSearchCertificateArguments(cn, sans, certMinTimeLeft)
 
 	// perform request
-	url := fmt.Sprintf("%s?%s", urlResourceCertificateSearch, req)
-	statusCode, _, body, err := c.request("GET", urlResource(url), nil)
-	if err != nil {
-		return nil, err
-	}
-	searchResult, err := parseSearchCertificateResponse(statusCode, body)
+	searchResult, err := c.rawClient().GetCertificate(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1626,35 +1407,26 @@ func (c *Connector) ListCertificates(filter endpoint.Filter) ([]certificate.Cert
 }
 
 func (c *Connector) getCertsBatch(offset, limit int, withExpired bool) ([]certificate.CertificateInfo, error) {
-	url := urlResourceCertificatesList + urlResource(
-		"?ParentDNRecursive="+neturl.QueryEscape(getPolicyDN(c.zone))+
-			"&limit="+fmt.Sprintf("%d", limit)+
-			"&offset="+fmt.Sprintf("%d", offset))
+	query := []string{
+		"ParentDNRecursive=" + neturl.QueryEscape(getPolicyDN(c.zone)),
+		"limit=" + fmt.Sprintf("%d", limit),
+		"offset=" + fmt.Sprintf("%d", offset),
+	}
 	if !withExpired {
-		url += urlResource("&ValidToGreater=" + neturl.QueryEscape(time.Now().Format(time.RFC3339)))
+		query = append(query, "ValidToGreater="+neturl.QueryEscape(time.Now().Format(time.RFC3339)))
 	}
-	statusCode, status, body, err := c.request("GET", url, nil)
+
+	r, err := c.rawClient().GetCertificate(query)
 	if err != nil {
 		return nil, err
 	}
-	if statusCode != 200 {
-		return nil, fmt.Errorf("can`t get certificates list: %d %s\n%s", statusCode, status, string(body))
-	}
-	var r struct {
-		Certificates []struct {
-			DN   string
-			X509 certificate.CertificateInfo
-		}
-	}
-	err = json.Unmarshal(body, &r)
-	if err != nil {
-		return nil, err
-	}
+
 	infos := make([]certificate.CertificateInfo, len(r.Certificates))
 	for i, c := range r.Certificates {
 		c.X509.ID = c.DN
 		infos[i] = c.X509
 	}
+
 	return infos, nil
 }
 
@@ -1670,87 +1442,35 @@ func parseHostPort(s string) (host string, port string, err error) {
 }
 
 func (c *Connector) dissociate(certDN, applicationDN string) error {
-	req := struct {
-		CertificateDN string
-		ApplicationDN []string
-		DeleteOrphans bool
-	}{
-		certDN,
-		[]string{applicationDN},
-		true,
+	req := &tpp_structs.CertificateDissociate{
+		CertificateDN: certDN,
+		ApplicationDN: []string{applicationDN},
+		DeleteOrphans: true,
 	}
 	log.Println("Dissociating device", applicationDN)
-	statusCode, status, body, err := c.request("POST", urlResourceCertificatesDissociate, req)
-	if err != nil {
-		return err
-	}
-	if statusCode != 200 {
-		return fmt.Errorf("%w: We have problem with server response.\n  status: %s\n  body: %s\n", verror.ServerBadDataResponce, status, body)
-	}
-	return nil
+	return c.rawClient().PostCertificateDissociate(req)
 }
 
 func (c *Connector) associate(certDN, applicationDN string, pushToNew bool) error {
-	req := struct {
-		CertificateDN string
-		ApplicationDN []string
-		PushToNew     bool
-	}{
-		certDN,
-		[]string{applicationDN},
-		pushToNew,
+	req := tpp_structs.CertificateAssociate{
+		CertificateDN: certDN,
+		ApplicationDN: []string{applicationDN},
+		PushToNew:     pushToNew,
 	}
 	log.Println("Associating device", applicationDN)
-	statusCode, status, body, err := c.request("POST", urlResourceCertificatesAssociate, req)
+	err := c.rawClient().PostCertificateAssociate(&req)
 	if err != nil {
 		return err
-	}
-	if statusCode != 200 {
-		log.Printf("We have problem with server response.\n  status: %s\n  body: %s\n", status, body)
-		return verror.ServerBadDataResponce
 	}
 	return nil
 }
 
 func (c *Connector) configDNToGuid(objectDN string) (guid string, err error) {
-
-	req := struct {
-		ObjectDN string
-	}{
+	resp, err := c.rawClient().PostConfigDnToGuid(&tpp_structs.DNToGUIDRequest{
 		objectDN,
-	}
-
-	var resp struct {
-		ClassName        string `json:",omitempty"`
-		GUID             string `json:",omitempty"`
-		HierarchicalGUID string `json:",omitempty"`
-		Revision         int    `json:",omitempty"`
-		Result           int    `json:",omitempty"`
-	}
-
-	log.Println("Getting guid for object DN", objectDN)
-	statusCode, status, body, err := c.request("POST", urlResourceConfigDnToGuid, req)
-
+	})
 	if err != nil {
-		return guid, err
-	}
-
-	if statusCode == http.StatusOK {
-		err = json.Unmarshal(body, &resp)
-		if err != nil {
-			return guid, fmt.Errorf("failed to parse DNtoGuid results: %s, body: %s", err, body)
-		}
-	} else {
-		return guid, fmt.Errorf("request to %s failed: %s\n%s", urlResourceConfigDnToGuid, status, body)
-	}
-
-	if statusCode != 200 {
-		return "", verror.ServerBadDataResponce
-	}
-
-	if resp.Result == 400 {
-		log.Printf("object with DN %s doesn't exist", objectDN)
-		return "", nil
+		return "", err
 	}
 
 	if resp.Result != 1 {
@@ -1760,16 +1480,8 @@ func (c *Connector) configDNToGuid(objectDN string) (guid string, err error) {
 
 }
 
-func (c *Connector) findObjectsOfClass(req *findObjectsOfClassRequest) (*findObjectsOfClassResponse, error) {
-	statusCode, statusString, body, err := c.request("POST", urlResourceFindObjectsOfClass, req)
-	if err != nil {
-		return nil, err
-	}
-	response, err := parseFindObjectsOfClassResponse(statusCode, statusString, body)
-	if err != nil {
-		return nil, err
-	}
-	return &response, nil
+func (c *Connector) findObjectsOfClass(req *tpp_structs.FindObjectsOfClassRequest) (*tpp_structs.FindObjectsOfClassResponse, error) {
+	return c.rawClient().PostConfigFindObjectsOfClass(req)
 }
 
 // GetZonesByParent returns a list of valid zones for a TPP parent folder specified by parent
@@ -1781,7 +1493,7 @@ func (c *Connector) GetZonesByParent(parent string) ([]string, error) {
 		parentFolderDn = fmt.Sprintf("\\VED\\Policy\\%s", parentFolderDn)
 	}
 
-	request := findObjectsOfClassRequest{
+	request := tpp_structs.FindObjectsOfClassRequest{
 		Class:    "Policy",
 		ObjectDN: parentFolderDn,
 	}
@@ -1797,56 +1509,41 @@ func (c *Connector) GetZonesByParent(parent string) ([]string, error) {
 	return zones, nil
 }
 
-func createPolicyAttribute(c *Connector, at string, av []string, n string, l bool) (statusCode int, statusText string, body []byte, err error) {
-
-	request := policy.PolicySetAttributePayloadRequest{
+func createPolicyAttribute(c *Connector, at tpp_structs.TppAttribute, av []string, n string, l bool) error {
+	request := tpp_structs.PolicySetAttributePayloadRequest{
 		Locked:        l,
 		ObjectDN:      n,
 		Class:         policy.PolicyAttributeClass,
-		AttributeName: at,
+		AttributeName: string(at),
 		Values:        av,
 	}
+
 	// if is locked is a policy value
 	// if is not locked then is a default.
-
-	statusCode, statusText, body, err = c.request("POST", urlResourceWritePolicy, request)
+	response, err := c.rawClient().PostConfigWritePolicy(&request)
 	if err != nil {
-		return statusCode, statusText, body, err
-	}
-
-	var response policy.PolicySetAttributeResponse
-
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return statusCode, statusText, body, err
+		return err
 	}
 
 	if response.Error != "" {
 		err = fmt.Errorf(response.Error)
-		return statusCode, statusText, body, err
+		return err
 	}
 
-	return statusCode, statusText, body, err
+	return err
 }
 
-func getPolicyAttribute(c *Connector, at string, n string) (s []string, b *bool, err error) {
-
-	request := policy.PolicyGetAttributePayloadRequest{
+func getPolicyAttribute(c *Connector, at tpp_structs.TppAttribute, n string) (s []string, b *bool, err error) {
+	request := tpp_structs.PolicyGetAttributePayloadRequest{
 		ObjectDN:      n,
 		Class:         policy.PolicyAttributeClass,
-		AttributeName: at,
+		AttributeName: string(at),
 		Values:        []string{"1"},
 	}
+
 	// if is locked is a policy value
 	// if is not locked then is a default.
-	_, _, body, err := c.request("POST", urlResourceReadPolicy, request)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	var response policy.PolicyGetAttributeResponse
-	err = json.Unmarshal(body, &response)
-
+	response, err := c.rawClient().PostConfigReadPolicy(&request)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1861,101 +1558,101 @@ func getPolicyAttribute(c *Connector, at string, n string) (s []string, b *bool,
 func resetTPPAttributes(zone string, c *Connector) error {
 
 	//reset Contact
-	err := resetTPPAttribute(c, policy.TppContact, zone)
+	err := resetTPPAttribute(c, tpp_structs.TppContact, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset Domain Suffix Whitelist
-	err = resetTPPAttribute(c, policy.TppDomainSuffixWhitelist, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppDomainSuffixWhitelist, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset Prohibit Wildcard
-	err = resetTPPAttribute(c, policy.TppProhibitWildcard, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppProhibitWildcard, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset Certificate Authority
-	err = resetTPPAttribute(c, policy.TppCertificateAuthority, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppCertificateAuthority, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset Organization attribute
-	err = resetTPPAttribute(c, policy.TppOrganization, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppOrganization, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset Organizational Unit attribute
-	err = resetTPPAttribute(c, policy.TppOrganizationalUnit, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppOrganizationalUnit, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset City attribute
-	err = resetTPPAttribute(c, policy.TppCity, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppCity, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset State attribute
-	err = resetTPPAttribute(c, policy.TppState, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppState, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset Country attribute
-	err = resetTPPAttribute(c, policy.TppCountry, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppCountry, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset Key Algorithm attribute
-	err = resetTPPAttribute(c, policy.TppKeyAlgorithm, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppKeyAlgorithm, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset Key Bit Strength
-	err = resetTPPAttribute(c, policy.TppKeyBitStrength, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppKeyBitStrength, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset Elliptic Curve attribute
-	err = resetTPPAttribute(c, policy.TppEllipticCurve, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppEllipticCurve, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset Manual Csr attribute
-	err = resetTPPAttribute(c, policy.ServiceGenerated, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppManualCSR, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset Manual Csr attribute
-	err = resetTPPAttribute(c, policy.TppProhibitedSANTypes, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppProhibitedSANTypes, zone)
 	if err != nil {
 		return err
 	}
 
 	//reset Allow Private Key Reuse" & "Want Renewal
-	err = resetTPPAttribute(c, policy.TppAllowPrivateKeyReuse, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppAllowPrivateKeyReuse, zone)
 	if err != nil {
 		return err
 	}
 
-	err = resetTPPAttribute(c, policy.TppWantRenewal, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppWantRenewal, zone)
 	if err != nil {
 		return err
 	}
 
-	err = resetTPPAttribute(c, policy.TppManagementType, zone)
+	err = resetTPPAttribute(c, tpp_structs.TppManagementType, zone)
 	if err != nil {
 		return err
 	}
@@ -1963,24 +1660,16 @@ func resetTPPAttributes(zone string, c *Connector) error {
 	return nil
 }
 
-func resetTPPAttribute(c *Connector, at, zone string) error {
-
-	request := policy.ClearTTPAttributesRequest{
+func resetTPPAttribute(c *Connector, at tpp_structs.TppAttribute, zone string) error {
+	request := tpp_structs.ClearTTPAttributesRequest{
 		ObjectDN:      zone,
 		Class:         policy.PolicyAttributeClass,
-		AttributeName: at,
+		AttributeName: string(at),
 	}
 	// if is locked is a policy value
 	// if is not locked then is a default.
 
-	_, _, body, err := c.request("POST", urlResourceCleanPolicy, request)
-	if err != nil {
-		return err
-	}
-
-	var response policy.PolicySetAttributeResponse
-
-	err = json.Unmarshal(body, &response)
+	response, err := c.rawClient().PostConfigCleanPolicy(&request)
 	if err != nil {
 		return err
 	}
@@ -2006,69 +1695,18 @@ func (c *Connector) RetrieveSSHCertificate(req *certificate.SshCertRequest) (res
 func (c *Connector) RetrieveCertificateMetaData(dn string) (*certificate.CertificateMetaData, error) {
 
 	//first step convert dn to guid
-	request := DNToGUIDRequest{ObjectDN: dn}
-	statusCode, status, body, err := c.request("POST", urlResourceDNToGUID, request)
+	request := tpp_structs.DNToGUIDRequest{ObjectDN: dn}
 
-	if err != nil {
-		return nil, err
-	}
-
-	guidInfo, err := parseDNToGUIDRequestResponse(statusCode, status, body)
-
+	guidInfo, err := c.rawClient().PostConfigDnToGuid(&request)
 	if err != nil {
 		return nil, err
 	}
 
 	//second step get certificate metadata
-	url := fmt.Sprintf("%s%s", urlResourceCertificate, guidInfo.GUID)
-
-	statusCode, status, body, err = c.request("GET", urlResource(url), nil)
-
+	data, err := c.rawClient().GetCertificateById(guidInfo.GUID)
 	if err != nil {
 		return nil, err
 	}
 
-	data, err := parseCertificateMetaData(statusCode, status, body)
-	if err != nil {
-		return nil, err
-	}
-
-	return data, nil
-
-}
-
-func parseDNToGUIDRequestResponse(httpStatusCode int, httpStatus string, body []byte) (*DNToGUIDResponse, error) {
-	switch httpStatusCode {
-	case http.StatusOK, http.StatusCreated:
-		reqData, err := parseDNToGUIDResponseData(body)
-		if err != nil {
-			return nil, err
-		}
-		return reqData, nil
-	default:
-		return nil, fmt.Errorf("Unexpected status code on TPP DN to GUID request.\n Status:\n %s. \n Body:\n %s\n", httpStatus, body)
-	}
-}
-
-func parseDNToGUIDResponseData(b []byte) (data *DNToGUIDResponse, err error) {
-	err = json.Unmarshal(b, &data)
-	return
-}
-
-func parseCertificateMetaData(httpStatusCode int, httpStatus string, body []byte) (*certificate.CertificateMetaData, error) {
-	switch httpStatusCode {
-	case http.StatusOK, http.StatusCreated:
-		reqData, err := parseCertificateMetaDataResponse(body)
-		if err != nil {
-			return nil, err
-		}
-		return reqData, nil
-	default:
-		return nil, fmt.Errorf("Unexpected status code on TPP DN to GUID request.\n Status:\n %s. \n Body:\n %s\n", httpStatus, body)
-	}
-}
-
-func parseCertificateMetaDataResponse(b []byte) (data *certificate.CertificateMetaData, err error) {
-	err = json.Unmarshal(b, &data)
-	return
+	return &data.CertificateMetaData, nil
 }

@@ -26,16 +26,18 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"github.com/Venafi/vcert/v4/pkg/util"
-	"github.com/youmark/pkcs8"
 	"net"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/Venafi/vcert/v4/pkg/verror"
+	"github.com/Venafi/vcert/v4/pkg/util"
+	"github.com/youmark/pkcs8"
+
 	"reflect"
 	"sort"
+
+	"github.com/Venafi/vcert/v4/pkg/verror"
 )
 
 // EllipticCurve represents the types of supported elliptic curves
@@ -240,52 +242,6 @@ type SshCertRequest struct {
 	Timeout time.Duration
 }
 
-type TPPSshCertRequest struct {
-	CADN                      string                 `json:"CADN,omitempty"`
-	PolicyDN                  string                 `json:"PolicyDN,omitempty"`
-	ObjectName                string                 `json:"ObjectName,omitempty"`
-	DestinationAddresses      []string               `json:"DestinationAddresses,omitempty"`
-	KeyId                     string                 `json:"KeyId,omitempty"`
-	Principals                []string               `json:"Principals,omitempty"`
-	ValidityPeriod            string                 `json:"ValidityPeriod,omitempty"`
-	PublicKeyData             string                 `json:"PublicKeyData,omitempty"`
-	Extensions                map[string]interface{} `json:"Extensions,omitempty"`
-	ForceCommand              string                 `json:"ForceCommand,omitempty"`
-	SourceAddresses           []string               `json:"SourceAddresses,omitempty"`
-	IncludePrivateKeyData     bool                   `json:"IncludePrivateKeyData,omitempty"`
-	PrivateKeyPassphrase      string                 `json:"PrivateKeyPassphrase,omitempty"`
-	IncludeCertificateDetails bool                   `json:"IncludeCertificateDetails,omitempty"`
-	ProcessingTimeout         string                 `json:"ProcessingTimeout,omitempty"`
-}
-
-type TppSshCertResponseInfo struct {
-	ErrorCode    int
-	ErrorMessage string
-	Success      bool
-}
-
-type TppSshCertRetrieveRequest struct {
-	Guid                      string
-	DN                        string
-	IncludePrivateKeyData     bool
-	PrivateKeyPassphrase      string
-	PrivateKeyFormat          string
-	IncludeCertificateDetails bool
-}
-
-type TppSshCertOperationResponse struct {
-	ProcessingDetails  ProcessingDetails
-	Guid               string
-	DN                 string
-	CertificateData    string
-	PrivateKeyData     string
-	PublicKeyData      string
-	CAGuid             string
-	CADN               string
-	CertificateDetails SshCertificateDetails
-	Response           TppSshCertResponseInfo
-}
-
 type SshCertificateObject struct {
 	Guid               string
 	DN                 string
@@ -343,6 +299,7 @@ type ImportRequest struct {
 	CustomFields    []CustomField
 }
 
+// RESP: vedsdk/certificates/import
 type ImportResponse struct {
 	CertificateDN      string `json:",omitempty"`
 	CertId             string `json:",omitempty"`
@@ -371,9 +328,10 @@ type CertificateInfo struct {
 
 type SearchRequest []string
 
+// RESP: vedsdk/certificates
 type CertSearchResponse struct {
-	Certificates []CertSeachInfo `json:"Certificates"`
-	Count        int             `json:"TotalCount"`
+	Certificates []CertificateSearchInfo `json:"Certificates"`
+	Count        int                     `json:"TotalCount"`
 }
 
 type CertificateMetaData struct {
@@ -445,9 +403,14 @@ type CustomFieldDetails struct {
 	Value []string `json:"Value"`
 }
 
-type CertSeachInfo struct {
-	CertificateRequestId   string `json:"DN"`
-	CertificateRequestGuid string `json:"Guid"`
+type CertificateSearchInfo struct {
+	CreatedOn   string
+	DN          string
+	Guid        string
+	Name        string
+	ParentDn    string
+	SchemaClass string
+	X509        CertificateInfo
 }
 
 // SetCSR sets CSR from PEM or DER format

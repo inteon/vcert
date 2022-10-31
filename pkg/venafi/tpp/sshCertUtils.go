@@ -17,10 +17,8 @@
 package tpp
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	netUrl "net/url"
 	"strings"
 	"time"
@@ -28,6 +26,7 @@ import (
 	"github.com/Venafi/vcert/v4/pkg/certificate"
 	"github.com/Venafi/vcert/v4/pkg/endpoint"
 	"github.com/Venafi/vcert/v4/pkg/util"
+	"github.com/Venafi/vcert/v4/pkg/venafi/tpp/tpp_api/tpp_structs"
 )
 
 const (
@@ -35,7 +34,6 @@ const (
 )
 
 func RequestSshCertificate(c *Connector, req *certificate.SshCertRequest) (*certificate.SshCertificateObject, error) {
-
 	sshCertReq := convertToSshCertReq(req)
 
 	if sshCertReq.KeyId == "" {
@@ -45,14 +43,9 @@ func RequestSshCertificate(c *Connector, req *certificate.SshCertRequest) (*cert
 	}
 
 	//TODO: Maybe, there is a better way to set the timeout.
-	c.client.Timeout = time.Duration(req.Timeout) * time.Second
-	statusCode, status, body, err := c.request("POST", urlResourceSshCertReq, sshCertReq)
-	if err != nil {
-		return nil, err
-	}
+	c.getHTTPClient().Timeout = time.Duration(req.Timeout) * time.Second
 
-	response, err := parseSshCertOperationResponse(statusCode, status, body)
-
+	response, err := c.rawClient().PostSshCertificateRequest(&sshCertReq)
 	if err != nil {
 		if response.Response.ErrorMessage != "" && c.verbose {
 			log.Println(util.GetJsonAsString(response.Response))
@@ -67,12 +60,11 @@ func RequestSshCertificate(c *Connector, req *certificate.SshCertRequest) (*cert
 		return nil, endpoint.ErrCertificateRejected{CertificateID: req.PickupID, Status: response.ProcessingDetails.StatusDescription}
 	}
 
-	return convertToGenericRetrieveResponse(&response), nil
+	return convertToGenericRetrieveResponse(response), nil
 }
 
-func convertToSshCertReq(req *certificate.SshCertRequest) certificate.TPPSshCertRequest {
-
-	var tppSshCertReq certificate.TPPSshCertRequest
+func convertToSshCertReq(req *certificate.SshCertRequest) tpp_structs.TPPSshCertRequest {
+	var tppSshCertReq tpp_structs.TPPSshCertRequest
 
 	if len(req.Principals) > 0 {
 		tppSshCertReq.Principals = req.Principals
@@ -142,7 +134,7 @@ func convertToSshCertReq(req *certificate.SshCertRequest) certificate.TPPSshCert
 }
 
 func RetrieveSshCertificate(c *Connector, req *certificate.SshCertRequest) (*certificate.SshCertificateObject, error) {
-	var reqRetrieve certificate.TppSshCertRetrieveRequest
+	var reqRetrieve tpp_structs.TppSshCertRetrieveRequest
 
 	if req.PickupID != "" {
 		reqRetrieve.DN = req.PickupID
@@ -162,7 +154,7 @@ func RetrieveSshCertificate(c *Connector, req *certificate.SshCertRequest) (*cer
 
 	startTime := time.Now()
 	for {
-		var retrieveResponse *certificate.TppSshCertOperationResponse
+		var retrieveResponse *tpp_structs.TppSshCertOperationResponse
 		retrieveResponse, err := retrieveSshCerOnce(reqRetrieve, c)
 		if err != nil {
 			return nil, err
@@ -185,59 +177,11 @@ func RetrieveSshCertificate(c *Connector, req *certificate.SshCertRequest) (*cer
 	}
 }
 
-func retrieveSshCerOnce(sshRetrieveReq certificate.TppSshCertRetrieveRequest, c *Connector) (*certificate.TppSshCertOperationResponse, error) {
-	statusCode, status, body, err := c.request("POST", urlResourceSshCertRet, sshRetrieveReq)
-	if err != nil {
-		return nil, err
-	}
-	retrieveResponse, err := parseSshCertOperationResponse(statusCode, status, body)
-	if err != nil {
-		return nil, err
-	}
-	return &retrieveResponse, nil
+func retrieveSshCerOnce(sshRetrieveReq tpp_structs.TppSshCertRetrieveRequest, c *Connector) (*tpp_structs.TppSshCertOperationResponse, error) {
+	return c.rawClient().PostSshCertificateRetrieve(&sshRetrieveReq)
 }
 
-func parseSshCertOperationResponse(httpStatusCode int, httpStatus string, body []byte) (certificate.TppSshCertOperationResponse, error) {
-	var retrieveResponse certificate.TppSshCertOperationResponse
-	switch httpStatusCode {
-	case http.StatusOK, http.StatusAccepted:
-		response, err := parseSshCertData(body)
-		if err != nil {
-			return response, err
-		}
-
-		if !response.Response.Success {
-			return response, fmt.Errorf("error getting certificate object, error status: %v, error description: %s", response.Response.ErrorCode, response.Response.ErrorMessage)
-		}
-
-		if response.ProcessingDetails.Status == "Rejected" {
-			return response, fmt.Errorf("error getting certificate object, error status: %s, error description: %s", response.ProcessingDetails.Status, response.ProcessingDetails.StatusDescription)
-		}
-		return response, nil
-	case http.StatusBadRequest:
-		response, err := parseSshCertData(body)
-		if err != nil {
-			return response, err
-		}
-		if !response.Response.Success {
-			return response, fmt.Errorf("error getting certificate object, error status: %d, error description: %s", response.Response.ErrorCode, response.Response.ErrorMessage)
-		}
-		return response, nil
-	case http.StatusUnauthorized:
-		err := NewAuthenticationError(body)
-		return retrieveResponse, err
-	default:
-		return retrieveResponse, fmt.Errorf("unexpected status code. Status: %s", httpStatus)
-	}
-}
-
-func parseSshCertData(b []byte) (data certificate.TppSshCertOperationResponse, err error) {
-	err = json.Unmarshal(b, &data)
-	return
-}
-
-func convertToGenericRetrieveResponse(data *certificate.TppSshCertOperationResponse) *certificate.SshCertificateObject {
-
+func convertToGenericRetrieveResponse(data *tpp_structs.TppSshCertOperationResponse) *certificate.SshCertificateObject {
 	response := &certificate.SshCertificateObject{}
 
 	response.CertificateDetails = data.CertificateDetails
@@ -253,41 +197,31 @@ func convertToGenericRetrieveResponse(data *certificate.TppSshCertOperationRespo
 	return response
 }
 
-func getSshConfigUrl(key, value string) string {
-	var url string
-	query := fmt.Sprintf("%s=%s", key, value)
-	query = netUrl.PathEscape(query)
-	url = fmt.Sprintf("%s?%s", urlResourceSshCAPubKey, query)
-	return url
+func getSshConfigUrl(key, value string) (query string) {
+	query = fmt.Sprintf("%s=%s", key, value)
+	return netUrl.PathEscape(query)
 }
 
 func RetrieveSshConfig(c *Connector, ca *certificate.SshCaTemplateRequest) (*certificate.SshConfig, error) {
-
-	var url string
+	var query string
 	if ca.Template != "" {
 		fullPath := getSshCaDN(ca.Template)
-		url = getSshConfigUrl("DN", fullPath)
+		query = getSshConfigUrl("DN", fullPath)
 		fmt.Println("Retrieving the configured CA public key for template:", fullPath)
 	} else if ca.Guid != "" {
-		url = getSshConfigUrl("guid", ca.Guid)
+		query = getSshConfigUrl("guid", ca.Guid)
 		fmt.Println("Retrieving the configured CA public key for template with GUID:", ca.Guid)
 	} else {
 		return nil, fmt.Errorf("CA template or GUID are not specified")
 	}
 
-	statusCode, status, body, err := c.request("GET", urlResource(url), nil)
-
+	data, err := c.rawClient().GetSshTemplatePublicKeyData([]string{query})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error while retriving CA public key, error %w", err)
 	}
-	conf := certificate.SshConfig{}
-	switch statusCode {
 
-	case http.StatusOK, http.StatusAccepted:
-		conf.CaPublicKey = string(body)
-
-	default:
-		return nil, fmt.Errorf("error while retriving CA public key, error body:%s, status:%s and status code:%v", string(body), status, statusCode)
+	conf := certificate.SshConfig{
+		CaPublicKey: string(data),
 	}
 
 	if c.accessToken != "" {
@@ -305,30 +239,11 @@ func RetrieveSshConfig(c *Connector, ca *certificate.SshCaTemplateRequest) (*cer
 }
 
 func GetAvailableSshTemplates(c *Connector) ([]certificate.SshAvaliableTemplate, error) {
-	var response []certificate.SshAvaliableTemplate
-	statusCode, status, body, err := c.request("GET", urlResourceSshTemplateAvaliable, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	switch statusCode {
-	case http.StatusOK:
-		response, err = parseSshTemplateData(body)
-		if err != nil {
-			return nil, err
-		}
-	case http.StatusNotFound:
-		// Return NotFound as this API method is unavailable in SSH Protect versions prior 21.4.0
-		return nil, fmt.Errorf(status)
-	default:
-		return nil, fmt.Errorf("error while retriving avaliable SSH templates, error body:%s, status:%s and status code:%v", string(body), status, statusCode)
-	}
-	return response, nil
+	return c.rawClient().GetSshTemplateAvaliable()
 }
 
 func RetrieveSshCaPrincipals(c *Connector, ca *certificate.SshCaTemplateRequest) ([]string, error) {
-
-	tppReq := certificate.SshTppCaTemplateRequest{}
+	tppReq := tpp_structs.SshTppCaTemplateRequest{}
 
 	if ca.Template != "" {
 		tppReq.DN = getSshCaDN(ca.Template)
@@ -340,14 +255,7 @@ func RetrieveSshCaPrincipals(c *Connector, ca *certificate.SshCaTemplateRequest)
 		return nil, fmt.Errorf("CA template or GUID are not specified")
 	}
 
-	statusCode, status, body, err := c.request("POST", urlResourceSshCADetails, tppReq)
-
-	if err != nil {
-		return nil, err
-	}
-
-	data, err := parseSshCaDetailsRequestResult(statusCode, status, body)
-
+	data, err := c.rawClient().PostSshTemplateRetrieve(&tppReq)
 	if err != nil {
 		return nil, err
 	}
@@ -355,41 +263,7 @@ func RetrieveSshCaPrincipals(c *Connector, ca *certificate.SshCaTemplateRequest)
 	return data.AccessControl.DefaultPrincipals, nil
 }
 
-func parseSshCaDetailsRequestResult(httpStatusCode int, httpStatus string, body []byte) (*certificate.SshTppCaTemplateResponse, error) {
-	switch httpStatusCode {
-	case http.StatusOK, http.StatusAccepted:
-		data, err := parseSshCaDetailsRequestData(body)
-		if err != nil {
-			return nil, err
-		}
-		if !data.Response.Success {
-			return data, fmt.Errorf("error requesting CA template details, error code: %d, error description: %s", data.Response.ErrorCode, data.Response.ErrorMessage)
-		}
-
-		return data, nil
-
-	default:
-		data, err := parseSshCaDetailsRequestData(body)
-		if err != nil {
-			return nil, err
-		}
-		return data, fmt.Errorf("unexpected status code on TPP CA details Request. Status code: %s, %s", httpStatus, data.Response.ErrorMessage)
-
-	}
-}
-
-func parseSshCaDetailsRequestData(b []byte) (data *certificate.SshTppCaTemplateResponse, err error) {
-	err = json.Unmarshal(b, &data)
-	return
-}
-
-func parseSshTemplateData(b []byte) (data []certificate.SshAvaliableTemplate, err error) {
-	err = json.Unmarshal(b, &data)
-	return
-}
-
 func getSshCaDN(ca string) string {
-
 	fullPath := ca
 	if !strings.HasPrefix(ca, util.PathSeparator) {
 		fullPath = util.PathSeparator + ca

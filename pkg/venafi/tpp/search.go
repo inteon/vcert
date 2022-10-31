@@ -18,36 +18,15 @@ package tpp
 
 import (
 	"crypto/sha1"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"github.com/Venafi/vcert/v4/pkg/certificate"
-	"net/http"
 	neturl "net/url"
 	"strings"
 	"time"
+
+	"github.com/Venafi/vcert/v4/pkg/certificate"
+	"github.com/Venafi/vcert/v4/pkg/venafi/tpp/tpp_api/tpp_structs"
 )
-
-type SearchRequest []string
-
-type ConfigReadDNRequest struct {
-	ObjectDN      string `json:",omitempty"`
-	AttributeName string `json:",omitempty"`
-}
-
-type ConfigReadDNResponse struct {
-	Result int      `json:",omitempty"`
-	Values []string `json:",omitempty"`
-}
-
-type CertificateDetailsResponse struct {
-	CustomFields []struct {
-		Name  string
-		Value []string
-	}
-	Consumers []string
-	Disabled  bool `json:",omitempty"`
-}
 
 func (c *Connector) searchCertificatesByFingerprint(fp string) (*certificate.CertSearchResponse, error) {
 	fp = strings.Replace(fp, ":", "", -1)
@@ -60,106 +39,15 @@ func (c *Connector) searchCertificatesByFingerprint(fp string) (*certificate.Cer
 	return c.SearchCertificates(&req)
 }
 
-func (c *Connector) configReadDN(req ConfigReadDNRequest) (resp ConfigReadDNResponse, err error) {
-
-	statusCode, status, body, err := c.request("POST", urlResourceConfigReadDn, req)
-	if err != nil {
-		return resp, err
-	}
-
-	if statusCode == http.StatusOK {
-		err = json.Unmarshal(body, &resp)
-		if err != nil {
-			return resp, err
-		}
-	} else {
-		return resp, fmt.Errorf("unexpected status code on %s. Status: %s", urlResourceConfigReadDn, status)
-	}
-
-	return resp, nil
+func (c *Connector) configReadDN(req tpp_structs.ConfigReadDNRequest) (resp *tpp_structs.ConfigReadDNResponse, err error) {
+	return c.rawClient().PostConfigReadDn(&req)
 }
 
-func (c *Connector) searchCertificateDetails(guid string) (*CertificateDetailsResponse, error) {
-	var err error
-
-	url := fmt.Sprintf("%s%s", urlResourceCertificateSearch, guid)
-	statusCode, _, body, err := c.request("GET", urlResource(url), nil)
-	if err != nil {
-		return nil, err
-	}
-	return parseCertificateDetailsResponse(statusCode, body)
+func (c *Connector) searchCertificateDetails(guid string) (*tpp_structs.CertificateDetailsResponse, error) {
+	return c.rawClient().GetCertificateById(guid)
 }
 
-func parseCertificateDetailsResponse(statusCode int, body []byte) (searchResult *CertificateDetailsResponse, err error) {
-	switch statusCode {
-	case http.StatusOK:
-		var searchResult = &CertificateDetailsResponse{}
-		err = json.Unmarshal(body, searchResult)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to parse search results: %s, body: %s", err, body)
-		}
-		return searchResult, nil
-	default:
-		if body != nil {
-			return nil, NewResponseError(body)
-		} else {
-			return nil, fmt.Errorf("Unexpected status code on certificate search. Status: %d", statusCode)
-		}
-	}
-}
-
-func ParseCertificateSearchResponse(httpStatusCode int, body []byte) (searchResult *certificate.CertSearchResponse, err error) {
-	switch httpStatusCode {
-	case http.StatusOK:
-		var searchResult = &certificate.CertSearchResponse{}
-		err = json.Unmarshal(body, searchResult)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to parse search results: %s, body: %s", err, body)
-		}
-		return searchResult, nil
-	default:
-		if body != nil {
-			return nil, NewResponseError(body)
-		} else {
-			return nil, fmt.Errorf("Unexpected status code on certificate search. Status: %d", httpStatusCode)
-		}
-	}
-}
-
-type CertificateSearchResponse struct {
-	Certificates []CertificateSearchInfo `json:"Certificates"`
-	Count        int                     `json:"TotalCount"`
-}
-
-type CertificateSearchInfo struct {
-	CreatedOn   string
-	DN          string
-	Guid        string
-	Name        string
-	ParentDn    string
-	SchemaClass string
-	X509        certificate.CertificateInfo
-}
-
-func parseSearchCertificateResponse(httpStatusCode int, body []byte) (certificates *CertificateSearchResponse, err error) {
-	switch httpStatusCode {
-	case http.StatusOK:
-		var searchResult = &CertificateSearchResponse{}
-		err = json.Unmarshal(body, searchResult)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to parse search results: %s, body: %s", err, body)
-		}
-		return searchResult, nil
-	default:
-		if body != nil {
-			return nil, NewResponseError(body)
-		} else {
-			return nil, fmt.Errorf("Unexpected status code on certificate search. Status: %d", httpStatusCode)
-		}
-	}
-}
-
-func formatSearchCertificateArguments(cn string, sans *certificate.Sans, certMinTimeLeft time.Duration) string {
+func formatSearchCertificateArguments(cn string, sans *certificate.Sans, certMinTimeLeft time.Duration) []string {
 	// get future (or past) date for certificate validation
 	date := time.Now().Add(certMinTimeLeft)
 	// create request arguments
@@ -175,7 +63,7 @@ func formatSearchCertificateArguments(cn string, sans *certificate.Sans, certMin
 
 	req = append(req, fmt.Sprintf("ValidToGreater=%s", neturl.QueryEscape(date.Format(time.RFC3339))))
 
-	return strings.Join(req, "&")
+	return req
 }
 
 func calcThumbprint(cert string) string {

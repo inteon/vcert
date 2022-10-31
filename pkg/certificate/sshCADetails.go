@@ -5,16 +5,6 @@ type SshCaTemplateRequest struct {
 	Guid     string
 }
 
-type SshTppCaTemplateRequest struct {
-	DN   string `json:"DN,omitempty"`
-	Guid string `json:"Guid,omitempty"`
-}
-
-type SshTppCaTemplateResponse struct {
-	AccessControl AccessControl
-	Response      TppSshCertResponseInfo `json:"Response,omitempty"`
-}
-
 type AccessControl struct {
 	DefaultPrincipals []string
 }
