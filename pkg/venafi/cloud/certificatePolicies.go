@@ -17,6 +17,7 @@
 package cloud
 
 import (
+	"sort"
 	"strings"
 	"time"
 
@@ -133,23 +134,41 @@ func (ct certificateTemplate) toPolicy() (p endpoint.Policy) {
 	}
 	p.AllowWildcards = allowWildCards
 
-	for _, kt := range ct.KeyTypes {
-		keyConfiguration := endpoint.AllowedKeyConfiguration{}
-		if err := keyConfiguration.KeyType.Set(string(kt.KeyType), ""); err != nil {
-			panic(err)
+	keyTypes := map[certificate.KeyType]*endpoint.AllowedKeyConfiguration{}
+	getKeyTypeValue := func(kt certificate.KeyType) *endpoint.AllowedKeyConfiguration {
+		if _, ok := keyTypes[kt]; !ok {
+			keyTypes[kt] = &endpoint.AllowedKeyConfiguration{KeyType: kt}
 		}
-
-		keyConfiguration.KeySizes = kt.KeyLengths[:]
-		for _, keyCurve := range kt.KeyCurves {
-			v := certificate.EllipticCurveNotSet
-			if err := (&v).Set(keyCurve); err != nil {
+		return keyTypes[kt]
+	}
+	for _, kt := range ct.KeyTypes {
+		var keyType certificate.KeyType
+		for _, keyLength := range kt.KeyLengths {
+			if err := keyType.Set(string(kt.KeyType), ""); err != nil {
 				panic(err)
 			}
-
-			keyConfiguration.KeyCurves = append(keyConfiguration.KeyCurves, v)
+			value := getKeyTypeValue(keyType)
+			value.KeySizes = append(value.KeySizes, keyLength)
 		}
-		p.AllowedKeyConfigurations = append(p.AllowedKeyConfigurations, keyConfiguration)
+		for _, keyCurve := range kt.KeyCurves {
+			if err := keyType.Set(string(kt.KeyType), keyCurve); err != nil {
+				panic(err)
+			}
+			ec := certificate.EllipticCurveNotSet
+			if err := ec.Set(keyCurve); err != nil {
+				panic(err)
+			}
+			value := getKeyTypeValue(keyType)
+			value.KeyCurves = append(value.KeyCurves, ec)
+		}
 	}
+
+	for _, kc := range keyTypes {
+		p.AllowedKeyConfigurations = append(p.AllowedKeyConfigurations, *kc)
+	}
+	sort.Slice(p.AllowedKeyConfigurations, func(i, j int) bool {
+		return p.AllowedKeyConfigurations[i].KeyType < p.AllowedKeyConfigurations[j].KeyType
+	})
 	return
 }
 
