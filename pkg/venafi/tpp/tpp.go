@@ -985,59 +985,58 @@ func (sp serverPolicy) toPolicy() (p endpoint.Policy) {
 	} else {
 		p.UpnSanRegExs = []string{}
 	}
+
+	algorithms := []certificate.KeyType{certificate.KeyTypeRSA, certificate.KeyTypeECDSA, certificate.KeyTypeED25519}
 	if sp.KeyPair.KeyAlgorithm.Locked {
 		var keyType certificate.KeyType
-		if err := keyType.Set(sp.KeyPair.KeyAlgorithm.Value, sp.KeyPair.EllipticCurve.Value); err != nil {
+		if err := keyType.Set(sp.KeyPair.KeyAlgorithm.Value, ""); err != nil {
 			panic(err)
 		}
-		key := endpoint.AllowedKeyConfiguration{KeyType: keyType}
 		if keyType == certificate.KeyTypeRSA {
-			if sp.KeyPair.KeySize.Locked {
-				for _, i := range certificate.AllSupportedKeySizes() {
-					if i >= sp.KeyPair.KeySize.Value {
-						key.KeySizes = append(key.KeySizes, i)
-					}
-				}
-			} else {
-				key.KeySizes = certificate.AllSupportedKeySizes()
-			}
+			algorithms = []certificate.KeyType{certificate.KeyTypeRSA}
 		} else {
-			var curve certificate.EllipticCurve
-			if sp.KeyPair.EllipticCurve.Locked {
-				if err := curve.Set(sp.KeyPair.EllipticCurve.Value); err != nil {
-					panic(err)
-				}
-				key.KeyCurves = append(key.KeyCurves, curve)
-			} else {
-				key.KeyCurves = certificate.AllSupportedCurves()
-			}
-
-		}
-		p.AllowedKeyConfigurations = append(p.AllowedKeyConfigurations, key)
-	} else {
-		var ks []int
-		for _, s := range certificate.AllSupportedKeySizes() {
-			if !sp.KeyPair.KeySize.Locked || s >= sp.KeyPair.KeySize.Value {
-				ks = append(ks, s)
-			}
-		}
-		p.AllowedKeyConfigurations = append(p.AllowedKeyConfigurations, endpoint.AllowedKeyConfiguration{
-			KeyType: certificate.KeyTypeRSA, KeySizes: ks,
-		})
-		if sp.KeyPair.EllipticCurve.Locked {
-			var curve certificate.EllipticCurve
-			if err := curve.Set(sp.KeyPair.EllipticCurve.Value); err != nil {
-				panic(err)
-			}
-			p.AllowedKeyConfigurations = append(p.AllowedKeyConfigurations, endpoint.AllowedKeyConfiguration{
-				KeyType: certificate.KeyTypeECDSA, KeyCurves: []certificate.EllipticCurve{curve},
-			})
-		} else {
-			p.AllowedKeyConfigurations = append(p.AllowedKeyConfigurations, endpoint.AllowedKeyConfiguration{
-				KeyType: certificate.KeyTypeECDSA, KeyCurves: certificate.AllSupportedCurves(),
-			})
+			algorithms = []certificate.KeyType{certificate.KeyTypeECDSA, certificate.KeyTypeED25519}
 		}
 	}
+
+	for _, algo := range algorithms {
+		kc := endpoint.AllowedKeyConfiguration{
+			KeyType: algo,
+		}
+		switch algo {
+		case certificate.KeyTypeRSA:
+			for _, s := range certificate.AllSupportedKeySizes() {
+				if !sp.KeyPair.KeySize.Locked || s >= sp.KeyPair.KeySize.Value {
+					kc.KeySizes = append(kc.KeySizes, s)
+				}
+			}
+		case certificate.KeyTypeECDSA:
+			for _, curve := range certificate.AllSupportedECCurves() {
+				var lockedCurve certificate.EllipticCurve
+				if err := lockedCurve.Set(sp.KeyPair.EllipticCurve.Value); err != nil {
+					panic(err)
+				}
+
+				if !sp.KeyPair.EllipticCurve.Locked || curve == lockedCurve {
+					kc.KeyCurves = append(kc.KeyCurves, curve)
+				}
+			}
+		case certificate.KeyTypeED25519:
+			for _, curve := range []certificate.EllipticCurve{certificate.EllipticCurveED25519} {
+				var lockedCurve certificate.EllipticCurve
+				if err := lockedCurve.Set(sp.KeyPair.EllipticCurve.Value); err != nil {
+					panic(err)
+				}
+
+				if !sp.KeyPair.EllipticCurve.Locked || curve == lockedCurve {
+					kc.KeyCurves = append(kc.KeyCurves, curve)
+				}
+			}
+		}
+
+		p.AllowedKeyConfigurations = append(p.AllowedKeyConfigurations, kc)
+	}
+
 	p.AllowWildcards = sp.WildcardsAllowed
 	p.AllowKeyReuse = sp.PrivateKeyReuseAllowed
 	return

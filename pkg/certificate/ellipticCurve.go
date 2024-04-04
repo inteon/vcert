@@ -97,6 +97,6 @@ func (ec *EllipticCurve) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
-func AllSupportedCurves() []EllipticCurve {
-	return []EllipticCurve{EllipticCurveP521, EllipticCurveP256, EllipticCurveP384, EllipticCurveED25519}
+func AllSupportedECCurves() []EllipticCurve {
+	return []EllipticCurve{EllipticCurveP521, EllipticCurveP256, EllipticCurveP384}
 }

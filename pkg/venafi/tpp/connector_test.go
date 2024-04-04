@@ -1982,7 +1982,8 @@ func TestReadPolicyConfiguration(t *testing.T) {
 				[]string{".*"},
 				[]endpoint.AllowedKeyConfiguration{
 					{certificate.KeyTypeRSA, certificate.AllSupportedKeySizes(), nil},
-					{certificate.KeyTypeECDSA, nil, certificate.AllSupportedCurves()},
+					{certificate.KeyTypeECDSA, nil, certificate.AllSupportedECCurves()},
+					{certificate.KeyTypeED25519, nil, []certificate.EllipticCurve{certificate.EllipticCurveED25519}},
 				},
 				[]string{".*"},
 				[]string{".*"},
