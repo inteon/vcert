@@ -865,17 +865,20 @@ func (sp serverPolicy) toZoneConfig(zc *endpoint.ZoneConfiguration) {
 	if err != nil {
 		return
 	}
-	if sp.KeyPair.KeySize.Value != 0 {
-		key.KeySizes = []int{sp.KeyPair.KeySize.Value}
-	}
-	if sp.KeyPair.EllipticCurve.Value != "" {
+	switch key.KeyType {
+	case certificate.KeyTypeRSA:
+		if sp.KeyPair.KeySize.Value > 0 {
+			key.KeySizes = []int{sp.KeyPair.KeySize.Value}
+		}
+	case certificate.KeyTypeECDSA, certificate.KeyTypeED25519:
 		curve := certificate.EllipticCurveNotSet
-		err = curve.Set(sp.KeyPair.EllipticCurve.Value)
-		if err == nil {
-			key.KeyCurves = append(key.KeyCurves, curve)
+		if err := curve.Set(sp.KeyPair.EllipticCurve.Value); err == nil {
+			key.KeyCurves = []certificate.EllipticCurve{curve}
 		}
 	}
-	zc.KeyConfiguration = &key
+	if len(key.KeyCurves) > 0 || len(key.KeySizes) > 0 {
+		zc.KeyConfiguration = &key
+	}
 }
 
 func (sp serverPolicy) toPolicy() (p endpoint.Policy) {

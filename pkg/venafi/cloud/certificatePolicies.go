@@ -186,11 +186,20 @@ func (ct certificateTemplate) toZoneConfig(zc *endpoint.ZoneConfiguration) {
 	if err != nil {
 		return
 	}
-	if r.Key.Length == 0 {
-		return
+	switch key.KeyType {
+	case certificate.KeyTypeRSA:
+		if r.Key.Length > 0 {
+			key.KeySizes = []int{r.Key.Length}
+		}
+	case certificate.KeyTypeECDSA, certificate.KeyTypeED25519:
+		curve := certificate.EllipticCurveNotSet
+		if err := curve.Set(r.Key.Curve); err == nil {
+			key.KeyCurves = []certificate.EllipticCurve{curve}
+		}
 	}
-	key.KeySizes = []int{r.Key.Length}
-	zc.KeyConfiguration = &key
+	if len(key.KeySizes) > 0 || len(key.KeyCurves) > 0 {
+		zc.KeyConfiguration = &key
+	}
 }
 
 /*
